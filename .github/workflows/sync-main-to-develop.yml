@@ -1,0 +1,159 @@
+name: Sync Main to Develop
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+
+jobs:
+  sync-to-develop:
+    # main에 PR이 머지된 경우 실행
+    if: github.event.pull_request.merged == true
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 전체 히스토리를 가져와서 머지 작업 수행
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch latest branches
+        run: |
+          git fetch origin main
+          git fetch origin develop
+
+      - name: Attempt to merge main into develop
+        id: merge
+        continue-on-error: true
+        run: |
+          git checkout develop
+          git merge origin/main --no-edit
+          echo "merge_result=$?" >> $GITHUB_OUTPUT
+
+      - name: Push to develop if no conflicts
+        if: steps.merge.outcome == 'success'
+        run: |
+          git push origin develop
+          echo "✅ Successfully merged main into develop automatically"
+
+      - name: Create sync branch if conflicts exist
+        if: steps.merge.outcome == 'failure'
+        id: create_branch
+        run: |
+          # 충돌 발생 시 머지 중단
+          git merge --abort || true
+
+          # 타임스탬프로 고유한 브랜치명 생성
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          SYNC_BRANCH="sync/main-to-develop-${TIMESTAMP}"
+          echo "sync_branch=${SYNC_BRANCH}" >> $GITHUB_OUTPUT
+
+          # develop 베이스로 새 브랜치 생성
+          git checkout -b ${SYNC_BRANCH}
+
+          # main을 머지 시도 (충돌 상태 유지)
+          git merge origin/main --no-commit || true
+
+          # 충돌 파일 목록 수집
+          CONFLICT_FILES=$(git diff --name-only --diff-filter=U | sed 's/^/- /' || echo "- (파일 목록을 가져올 수 없습니다)")
+          echo "conflict_files<<EOF" >> $GITHUB_OUTPUT
+          echo "${CONFLICT_FILES}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          # 충돌 상태 그대로 커밋 (나중에 수동 해결)
+          git add .
+          git commit -m "Merge main into develop (conflicts exist)" || true
+
+          # 브랜치 푸시
+          git push origin ${SYNC_BRANCH}
+
+      - name: Create Pull Request for manual conflict resolution
+        if: steps.merge.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SOURCE_BRANCH="${{ github.head_ref }}"
+          MERGE_COMMIT="${{ github.event.pull_request.merge_commit_sha }}"
+          MERGED_BY="${{ github.event.pull_request.user.login }}"
+          SYNC_BRANCH="${{ steps.create_branch.outputs.sync_branch }}"
+          CONFLICT_FILES="${{ steps.create_branch.outputs.conflict_files }}"
+
+          # PR 본문 생성
+          PR_BODY=$(cat <<EOF
+          ## 🔄 자동 동기화 PR
+
+          이 PR은 Main 브랜치를 Develop에 동기화하기 위해 자동 생성되었습니다.
+
+          ### 원본 정보
+          - **머지된 브랜치**: \`${SOURCE_BRANCH}\`
+          - **머지 커밋**: \`${MERGE_COMMIT}\`
+          - **머지한 사람**: @${MERGED_BY}
+
+          ### ⚠️ 충돌 발생
+
+          다음 파일에서 충돌이 발생했습니다:
+          ${CONFLICT_FILES}
+
+          ### 해결 방법
+
+          1. 로컬에서 이 브랜치 체크아웃:
+             \`\`\`bash
+             git fetch origin
+             git checkout ${SYNC_BRANCH}
+             \`\`\`
+
+          2. 충돌 수동 해결:
+             \`\`\`bash
+             # 충돌 파일 확인
+             git status
+
+             # IDE 또는 에디터로 충돌 해결
+             # <<<<<<< HEAD
+             # =======
+             # >>>>>>> 부분을 확인하고 수정
+
+             # 해결 후 스테이징
+             git add .
+             git commit -m "Resolve merge conflicts"
+             git push origin ${SYNC_BRANCH}
+             \`\`\`
+
+          3. 테스트 실행 확인 (필요한 경우)
+
+          4. 이 PR 승인 및 머지
+
+          ---
+
+          _이 PR은 GitHub Actions에 의해 자동 생성되었습니다._
+          EOF
+          )
+
+          # GitHub CLI로 PR 생성
+          gh pr create \
+            --base develop \
+            --head ${SYNC_BRANCH} \
+            --title "[Auto] Sync main to develop (from ${SOURCE_BRANCH})" \
+            --body "${PR_BODY}" \
+            --assignee ${MERGED_BY}
+
+          echo "📝 Created PR for manual conflict resolution"
+
+      - name: Summary
+        if: always()
+        run: |
+          if [[ "${{ steps.merge.outcome }}" == "success" ]]; then
+            echo "### ✅ 자동 동기화 완료" >> $GITHUB_STEP_SUMMARY
+            echo "Main 브랜치가 Develop에 성공적으로 머지되었습니다." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ⚠️ 충돌 발생 - PR 생성됨" >> $GITHUB_STEP_SUMMARY
+            echo "충돌이 발생하여 동기화 PR이 자동 생성되었습니다." >> $GITHUB_STEP_SUMMARY
+            echo "PR: https://github.com/${{ github.repository }}/pulls" >> $GITHUB_STEP_SUMMARY
+          fi
